@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { postToFeishu } from "../lib/feishu";
 
-const LOW_BALANCE_THRESHOLD = 500;
+const LOW_BALANCE_THRESHOLD = 3000; // ≈ $30
 
 interface EvolinkCredits {
   remaining_credits: number;
@@ -67,10 +67,11 @@ export default async function handler(
     return;
   }
 
+  const estimatedUsd = (remaining_credits / 100).toFixed(1);
   const text =
     `⚠️ Evolink 余额预警\n\n` +
-    `账户余额: ${remaining_credits} 元\n` +
-    `已用额度: ${used_credits} 元\n\n` +
+    `账户余额: ${remaining_credits} 积分（约 $${estimatedUsd}）\n` +
+    `已用额度: ${used_credits} 积分\n\n` +
     `请及时充值！`;
 
   let result: { ok: boolean; data: unknown };
