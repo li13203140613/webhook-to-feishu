@@ -96,24 +96,38 @@ sign       = Base64(HMAC-SHA256(data, key=""))
 |---|---|---|
 | GET | `/api/webhook` | Health check — returns `{"status":"ok"}` |
 | POST | `/api/webhook` | Receive upstream webhook and forward to Feishu |
-| GET | `/api/check-balance` | Check Evolink credit balance; sends Feishu alert if < 500 |
+| GET | `/api/check-balance` | Check Evolink credit balance; sends Feishu alert if below threshold |
+| GET | `/api/daily-report` | Fetch BuilderPulse daily report, write to Feishu doc, notify group |
 
 ## Balance check
 
 `GET /api/check-balance` calls the Evolink API and checks `user.remaining_credits`.
 
-- **Balance ≥ 500** → returns `{"status":"ok","remaining_credits":...,"used_credits":...}` (no Feishu message)
-- **Balance < 500** → sends a Feishu alert and returns `{"status":"alert_sent",...}`
+- **Balance ≥ 3000 (~$30)** → returns `{"status":"ok",...}` (no Feishu message)
+- **Balance < 3000** → sends a Feishu alert and returns `{"status":"alert_sent",...}`
 
-This endpoint is also triggered automatically every 6 hours via a Vercel Cron Job (configured in `vercel.json`).
+Triggered automatically every 6 hours via Vercel Cron.
 
-Example alert message sent to Feishu:
+## Daily BuilderPulse report
 
-```
-⚠️ Evolink 余额预警
+`GET /api/daily-report` runs the full pipeline:
 
-账户余额: 212.80 元
-已用额度: 147987.89 元
+1. Determines today's date in `Asia/Shanghai` timezone
+2. Fetches `https://raw.githubusercontent.com/BuilderPulse/BuilderPulse/refs/heads/main/zh/{year}/{date}.md`
+3. Returns `{"status":"no_report"}` if the file is not published yet (HTTP 404)
+4. Parses the markdown — extracts title and up to three signal blockquotes
+5. Creates a new Feishu document titled `📰 BuilderPulse 日报 — {date}`
+6. Writes the full report as structured content blocks (headings, paragraphs, bullets)
+7. Posts a rich-text notification to the configured group webhook with the signals summary and a link to the document
 
-请及时充值！
-```
+Triggered automatically at **02:00 UTC (10:00 AM Beijing)** via Vercel Cron.
+
+### Additional env vars required
+
+| Variable | Description |
+|---|---|
+| `FEISHU_APP_ID` | Feishu app ID (for document API) |
+| `FEISHU_APP_SECRET` | Feishu app secret |
+| `FEISHU_DAILY_WEBHOOK_URL` | Group webhook URL for the daily notification (no signature required) |
+
+The Feishu app needs the `docx:document` (create/write documents) permission granted in the Feishu Developer Console.
