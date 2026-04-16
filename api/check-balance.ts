@@ -1,7 +1,11 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { postToFeishu } from "../lib/feishu";
 
-const LOW_BALANCE_THRESHOLD = 3000; // ≈ $30
+const THRESHOLDS = [
+  { level: 5000, emoji: "⚠️", label: "余额预警" },
+  { level: 2000, emoji: "🔴", label: "余额严重不足" },
+  { level: 1000, emoji: "🚨", label: "余额即将耗尽" },
+];
 
 interface EvolinkCredits {
   remaining_credits: number;
@@ -62,14 +66,17 @@ export default async function handler(
 
   const { remaining_credits, used_credits } = evolinkData.data.user;
 
-  if (remaining_credits >= LOW_BALANCE_THRESHOLD) {
+  const matched = THRESHOLDS.filter((t) => remaining_credits < t.level);
+  if (matched.length === 0) {
     res.status(200).json({ status: "ok", remaining_credits, used_credits });
     return;
   }
 
+  // Most urgent = the one with the lowest level threshold
+  const urgent = matched.reduce((a, b) => (a.level < b.level ? a : b));
   const estimatedUsd = (remaining_credits / 100).toFixed(1);
   const text =
-    `⚠️ Evolink 余额预警\n\n` +
+    `${urgent.emoji} Evolink ${urgent.label}\n\n` +
     `账户余额: ${remaining_credits} 积分（约 $${estimatedUsd}）\n` +
     `已用额度: ${used_credits} 积分\n\n` +
     `请及时充值！`;
