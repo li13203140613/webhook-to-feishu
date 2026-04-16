@@ -55,6 +55,8 @@ cp .env.example .env.local
 |---|---|
 | `FEISHU_WEBHOOK_URL` | Feishu bot webhook URL from the bot configuration page |
 | `FEISHU_WEBHOOK_SECRET` | Feishu bot signing secret (加签密钥) |
+| `EVOLINK_API_KEY` | Evolink API key for balance checks |
+| `EVOLINK_API_URL` | *(Optional)* Evolink credits endpoint. Defaults to `https://api.evolink.ai/v1/credits` |
 
 ### 3. Deploy to Vercel
 
@@ -94,3 +96,24 @@ sign       = Base64(HMAC-SHA256(data, key=""))
 |---|---|---|
 | GET | `/api/webhook` | Health check — returns `{"status":"ok"}` |
 | POST | `/api/webhook` | Receive upstream webhook and forward to Feishu |
+| GET | `/api/check-balance` | Check Evolink credit balance; sends Feishu alert if < 500 |
+
+## Balance check
+
+`GET /api/check-balance` calls the Evolink API and checks `user.remaining_credits`.
+
+- **Balance ≥ 500** → returns `{"status":"ok","remaining_credits":...,"used_credits":...}` (no Feishu message)
+- **Balance < 500** → sends a Feishu alert and returns `{"status":"alert_sent",...}`
+
+This endpoint is also triggered automatically every 6 hours via a Vercel Cron Job (configured in `vercel.json`).
+
+Example alert message sent to Feishu:
+
+```
+⚠️ Evolink 余额预警
+
+账户余额: 212.80 元
+已用额度: 147987.89 元
+
+请及时充值！
+```

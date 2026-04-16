@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import * as crypto from "crypto";
+import { postToFeishu } from "../lib/feishu";
 
 interface IncomingWebhook {
   type: string;
@@ -7,20 +7,6 @@ interface IncomingWebhook {
   content: string;
   values?: unknown[];
   timestamp: number;
-}
-
-interface FeishuPayload {
-  timestamp: string;
-  sign: string;
-  msg_type: string;
-  content: { text: string };
-}
-
-function generateSign(timestamp: string, secret: string): string {
-  const stringToSign = `${timestamp}\n${secret}`;
-  const hmac = crypto.createHmac("sha256", stringToSign);
-  hmac.update("");
-  return hmac.digest("base64");
 }
 
 function formatMessage(body: IncomingWebhook): string {
@@ -70,35 +56,20 @@ export default async function handler(
     return;
   }
 
-  const timestamp = String(Math.floor(Date.now() / 1000));
-  const sign = generateSign(timestamp, feishuSecret);
   const text = formatMessage(body);
 
-  const payload: FeishuPayload = {
-    timestamp,
-    sign,
-    msg_type: "text",
-    content: { text },
-  };
-
-  let feishuRes: Response;
+  let result: { ok: boolean; data: unknown };
   try {
-    feishuRes = await fetch(feishuUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+    result = await postToFeishu(feishuUrl, feishuSecret, text);
   } catch (err) {
     res.status(502).json({ error: "Failed to reach Feishu webhook", detail: String(err) });
     return;
   }
 
-  const feishuData = await feishuRes.json().catch(() => null);
-
-  if (!feishuRes.ok) {
-    res.status(502).json({ error: "Feishu returned an error", detail: feishuData });
+  if (!result.ok) {
+    res.status(502).json({ error: "Feishu returned an error", detail: result.data });
     return;
   }
 
-  res.status(200).json({ success: true, feishu: feishuData });
+  res.status(200).json({ success: true, feishu: result.data });
 }
