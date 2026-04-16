@@ -1,0 +1,29 @@
+{
+  "name": "webhook-to-feishu",
+  "version": "1.0.0",
+  "description": "Vercel serverless webhook converter — upstream webhook → Feishu bot",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel deploy",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/li13203140613/webhook-to-feishu.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/li13203140613/webhook-to-feishu/issues"
+  },
+  "homepage": "https://github.com/li13203140613/webhook-to-feishu#readme",
+  "dependencies": {
+    "@vercel/node": "^3.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
