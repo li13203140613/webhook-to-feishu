@@ -8,6 +8,9 @@ A Vercel serverless function that receives upstream webhooks and forwards them t
 2. The function formats the payload into a readable text message
 3. It generates a Feishu signature and POSTs to the Feishu bot webhook URL
 
+For `New API` Bark notifications, use `/api/bark` instead. It accepts a Bark-style
+GET request and forwards the message to Feishu.
+
 ## Upstream webhook format
 
 ```json
@@ -55,6 +58,7 @@ cp .env.example .env.local
 |---|---|
 | `FEISHU_WEBHOOK_URL` | Feishu bot webhook URL from the bot configuration page |
 | `FEISHU_WEBHOOK_SECRET` | Feishu bot signing secret (加签密钥) |
+| `BARK_PROXY_TOKEN` | Optional shared token for `/api/bark` requests |
 | `EVOLINK_API_KEY` | Evolink API key for balance checks |
 | `EVOLINK_API_URL` | *(Optional)* Evolink credits endpoint. Defaults to `https://api.evolink.ai/v1/credits` |
 
@@ -73,6 +77,21 @@ Set the upstream webhook URL to:
 ```
 https://<your-vercel-domain>/api/webhook
 ```
+
+### 5. Point `New API` Bark URL
+
+In `New API -> 通知配置 -> Bark通知`, fill:
+
+```
+https://<your-vercel-domain>/api/bark?token=YOUR_RANDOM_TOKEN&title={{title}}&content={{content}}
+```
+
+Notes:
+
+- `New API` will replace `{{title}}` and `{{content}}` automatically.
+- `BARK_PROXY_TOKEN` is optional, but recommended so the proxy cannot be abused.
+- If you do not want to use Bark mode, you can still use `Webhook通知` and point it to
+  `https://<your-vercel-domain>/api/webhook`.
 
 ## Local development
 
@@ -96,6 +115,7 @@ sign       = Base64(HMAC-SHA256(data, key=""))
 |---|---|---|
 | GET | `/api/webhook` | Health check — returns `{"status":"ok"}` |
 | POST | `/api/webhook` | Receive upstream webhook and forward to Feishu |
+| GET / POST | `/api/bark` | Accept Bark-style payloads and forward to Feishu |
 | GET | `/api/check-balance` | Check Evolink credit balance; sends Feishu alert if below threshold |
 | GET | `/api/daily-report` | Fetch BuilderPulse daily report, write to Feishu doc, notify group |
 
@@ -120,7 +140,9 @@ Triggered automatically every 6 hours via Vercel Cron.
 6. Writes the full report as structured content blocks (headings, paragraphs, bullets)
 7. Posts a rich-text notification to the configured group webhook with the signals summary and a link to the document
 
-Triggered automatically at **02:00 UTC (10:00 AM Beijing)** via Vercel Cron.
+Triggered automatically every two hours from **02:00 UTC through 14:00 UTC**
+(10:00 AM through 10:00 PM Beijing) via Vercel Cron.
+The function keeps retrying until the source report is published.
 
 ### Additional env vars required
 
@@ -129,5 +151,12 @@ Triggered automatically at **02:00 UTC (10:00 AM Beijing)** via Vercel Cron.
 | `FEISHU_APP_ID` | Feishu app ID (for document API) |
 | `FEISHU_APP_SECRET` | Feishu app secret |
 | `FEISHU_DAILY_WEBHOOK_URL` | Group webhook URL for the daily notification (no signature required) |
+| `FEISHU_DAILY_FOLDER_TOKEN` | Feishu Drive folder token for storing daily docs and deduplicating retries |
 
-The Feishu app needs the `docx:document` (create/write documents) permission granted in the Feishu Developer Console.
+When `FEISHU_DAILY_FOLDER_TOKEN` is configured, the function will:
+
+1. Create the daily doc inside that folder
+2. Check whether today's doc title already exists before sending
+3. Return `{"status":"already_sent"}` on later retries to avoid duplicate notifications
+
+The Feishu app needs the `docx:document` (create/write documents) permission granted in the Feishu Developer Console, and it must be able to access the target Drive folder used for daily reports.
