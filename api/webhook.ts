@@ -1,5 +1,9 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { postToFeishu } from "../lib/feishu";
+import { consumeNotificationThrottle } from "../lib/notification-throttle";
+
+const DEFAULT_FORWARD_INTERVAL_MINUTES = 30;
+const DEFAULT_FORWARD_THROTTLE_KEY = "outbound:feishu:notification";
 
 interface IncomingWebhook {
   type: string;
@@ -57,6 +61,27 @@ export default async function handler(
   }
 
   const text = formatMessage(body);
+  const throttleKey =
+    process.env.ALERT_FORWARD_THROTTLE_KEY ?? DEFAULT_FORWARD_THROTTLE_KEY;
+  const intervalMinutes = parsePositiveInt(
+    process.env.ALERT_FORWARD_INTERVAL_MINUTES,
+    DEFAULT_FORWARD_INTERVAL_MINUTES
+  );
+  const throttle = await consumeNotificationThrottle(throttleKey, intervalMinutes);
+
+  if (!throttle.allowed) {
+    res.status(200).json({
+      success: true,
+      status: "suppressed_by_rate_limit",
+      reason: "within_min_interval",
+      interval_minutes: throttle.interval_minutes,
+      last_sent_at: throttle.last_sent_at,
+      next_send_at: throttle.next_allowed_at,
+      throttle_backend: throttle.backend,
+      warning: throttle.warning,
+    });
+    return;
+  }
 
   let result: { ok: boolean; data: unknown };
   try {
@@ -71,5 +96,26 @@ export default async function handler(
     return;
   }
 
-  res.status(200).json({ success: true, feishu: result.data });
+  res.status(200).json({
+    success: true,
+    status: "forwarded",
+    interval_minutes: throttle.interval_minutes,
+    last_sent_at: throttle.last_sent_at,
+    throttle_backend: throttle.backend,
+    warning: throttle.warning,
+    feishu: result.data,
+  });
+}
+
+function parsePositiveInt(value: string | undefined, fallback: number): number {
+  if (!value) {
+    return fallback;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+
+  return parsed;
 }
