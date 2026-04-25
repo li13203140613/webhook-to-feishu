@@ -59,8 +59,14 @@ cp .env.example .env.local
 | `FEISHU_WEBHOOK_URL` | Feishu bot webhook URL from the bot configuration page |
 | `FEISHU_WEBHOOK_SECRET` | Feishu bot signing secret (加签密钥) |
 | `BARK_PROXY_TOKEN` | Optional shared token for `/api/bark` requests |
+| `ALERT_FORWARD_INTERVAL_MINUTES` | *(Optional)* Shared minimum reminder interval (minutes) for `/api/webhook`, `/api/bark`, and `/api/check-balance`. Defaults to `60` |
+| `ALERT_FORWARD_THROTTLE_KEY` | *(Optional)* Shared throttle key for `/api/webhook`, `/api/bark`, and `/api/check-balance`. Defaults to `outbound:feishu:notification` |
 | `EVOLINK_API_KEY` | Evolink API key for balance checks |
-| `EVOLINK_API_URL` | *(Optional)* Evolink credits endpoint. Defaults to `https://api.evolink.ai/v1/credits` |
+| `EVOLINK_API_URL` | *(Optional)* Evolink API base URL. Defaults to `https://api.evolink.ai/v1` |
+| `BALANCE_ALERT_STATE_KEY` | *(Optional)* KV key used to store balance alert state. Defaults to `evolink:balance-alert-state` |
+| `KV_REST_API_URL` | *(Optional but recommended)* Vercel KV REST URL. Enables cross-instance dedupe/throttling |
+| `KV_REST_API_TOKEN` | *(Optional but recommended)* Vercel KV REST token |
+| `DAILY_REPORT_STATE_KEY_PREFIX` | *(Optional)* Daily report dedupe state prefix. Defaults to `builderpulse:daily-report:sent` |
 
 ### 3. Deploy to Vercel
 
@@ -119,14 +125,29 @@ sign       = Base64(HMAC-SHA256(data, key=""))
 | GET | `/api/check-balance` | Check Evolink credit balance; sends Feishu alert if below threshold |
 | GET | `/api/daily-report` | Fetch BuilderPulse daily report, write to Feishu doc, notify group |
 
+## Upstream forward throttling
+
+`/api/webhook`, `/api/bark`, and `/api/check-balance` now share one throttle window.
+
+- If upstream triggers repeatedly within 60 minutes (default), only the first one is forwarded.
+- Later triggers within the same window return `{"status":"suppressed_by_rate_limit",...}` and are not sent to Feishu.
+- To make throttling consistent across serverless instances, configure `KV_REST_API_URL` and `KV_REST_API_TOKEN`.
+
 ## Balance check
 
 `GET /api/check-balance` calls the Evolink API and checks `user.remaining_credits`.
 
-- **Balance ≥ 3000 (~$30)** → returns `{"status":"ok",...}` (no Feishu message)
-- **Balance < 3000** → sends a Feishu alert and returns `{"status":"alert_sent",...}`
+- Alert thresholds:
+  - `<= 3000` → `余额低于 30 元`
+  - `<= 2000` → `余额低于 20 元`
+  - `<= 1000` → `余额低于 10 元`
+  - `<= 0` → `余额已耗尽`（立即提醒，不受共享限流限制）
+- When balance is healthy (not below any threshold), returns `{"status":"ok",...}` and sends no Feishu message.
+- When balance is below threshold:
+  - Sends only when crossing into a worse threshold than the last sent threshold.
+  - If the shared hourly throttle window is occupied, returns `{"status":"alert_suppressed","suppressed_reason":"shared_rate_limit"}`.
 
-Triggered automatically every 6 hours via Vercel Cron.
+Triggered automatically every hour via Vercel Cron.
 
 ## Daily BuilderPulse report
 
@@ -140,9 +161,9 @@ Triggered automatically every 6 hours via Vercel Cron.
 6. Writes the full report as structured content blocks (headings, paragraphs, bullets)
 7. Posts a rich-text notification to the configured group webhook with the signals summary and a link to the document
 
-Triggered automatically every two hours from **02:00 UTC through 14:00 UTC**
-(10:00 AM through 10:00 PM Beijing) via Vercel Cron.
-The function keeps retrying until the source report is published.
+Triggered automatically at **02:00 UTC and 04:00 UTC**
+(10:00 AM and 12:00 PM Beijing) via Vercel Cron.
+After one successful send for the day, later retries return `{"status":"already_sent"}`.
 
 ### Additional env vars required
 
@@ -152,6 +173,7 @@ The function keeps retrying until the source report is published.
 | `FEISHU_APP_SECRET` | Feishu app secret |
 | `FEISHU_DAILY_WEBHOOK_URL` | Group webhook URL for the daily notification (no signature required) |
 | `FEISHU_DAILY_FOLDER_TOKEN` | Feishu Drive folder token for storing daily docs and deduplicating retries |
+| `DAILY_REPORT_STATE_KEY_PREFIX` | Dedupe state key prefix (KV-backed when configured) |
 
 When `FEISHU_DAILY_FOLDER_TOKEN` is configured, the function will:
 

@@ -2,7 +2,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { postToFeishu } from "../lib/feishu";
 import { consumeNotificationThrottle } from "../lib/notification-throttle";
 
-const DEFAULT_FORWARD_INTERVAL_MINUTES = 30;
+const DEFAULT_FORWARD_INTERVAL_MINUTES = 60;
 const DEFAULT_FORWARD_THROTTLE_KEY = "outbound:feishu:notification";
 
 interface BarkForwardPayload {

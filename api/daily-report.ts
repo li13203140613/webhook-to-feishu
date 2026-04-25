@@ -7,10 +7,17 @@ import {
 } from "../lib/builderpulse";
 import {
   createDocument,
+  findDocumentByTitleInFolder,
   getTenantAccessToken,
   markdownToBlocks,
   writeBlocksToDocument,
 } from "../lib/feishu-doc";
+import {
+  readDailyReportSentState,
+  writeDailyReportSentState,
+} from "../lib/daily-report-state";
+
+const DEFAULT_DAILY_REPORT_STATE_KEY_PREFIX = "builderpulse:daily-report:sent";
 
 export default async function handler(
   req: VercelRequest,
@@ -24,6 +31,9 @@ export default async function handler(
   const appId = process.env.FEISHU_APP_ID;
   const appSecret = process.env.FEISHU_APP_SECRET;
   const dailyWebhookUrl = process.env.FEISHU_DAILY_WEBHOOK_URL;
+  const dailyFolderToken = normalizeFolderToken(
+    process.env.FEISHU_DAILY_FOLDER_TOKEN
+  );
 
   if (!appId || !appSecret || !dailyWebhookUrl) {
     res.status(500).json({
@@ -35,6 +45,24 @@ export default async function handler(
 
   // 1. Determine today's date in Asia/Shanghai timezone
   const date = getTodayShanghai();
+  const docTitle = `📰 BuilderPulse 日报 — ${date}`;
+  const stateKeyPrefix =
+    process.env.DAILY_REPORT_STATE_KEY_PREFIX ?? DEFAULT_DAILY_REPORT_STATE_KEY_PREFIX;
+  const stateKey = `${stateKeyPrefix}:${date}`;
+
+  const stateRead = await readDailyReportSentState(stateKey);
+  if (stateRead.state) {
+    res.status(200).json({
+      status: "already_sent",
+      date,
+      document_id: stateRead.state.document_id,
+      document_url: stateRead.state.document_url,
+      sent_at: stateRead.state.sent_at,
+      dedupe_backend: stateRead.backend,
+      warnings: collectWarnings(stateRead.warning),
+    });
+    return;
+  }
 
   // 2. Fetch report from GitHub
   let markdown: string | null;
@@ -54,6 +82,7 @@ export default async function handler(
 
   // 3. Parse markdown for title + signals
   const report = parseReport(markdown);
+  const readableMarkdown = buildReadableMarkdown(markdown, report, date);
 
   // 4. Get Feishu tenant access token
   let token: string;
@@ -66,12 +95,46 @@ export default async function handler(
     return;
   }
 
-  // 5. Create the Feishu document
-  const docTitle = `📰 BuilderPulse 日报 — ${date}`;
+  // 5. Skip retries once today's document already exists in the target folder.
+  if (dailyFolderToken) {
+    try {
+      const existing = await findDocumentByTitleInFolder(
+        token,
+        dailyFolderToken,
+        docTitle
+      );
+
+      if (existing) {
+        const stateWrite = await writeDailyReportSentState(
+          stateKey,
+          {
+            date,
+            sent_at: new Date().toISOString(),
+            document_id: existing.documentId,
+            document_url: existing.url,
+          },
+          stateRead.backend
+        );
+        res.status(200).json({
+          status: "already_sent",
+          date,
+          document_id: existing.documentId,
+          document_url: existing.url,
+          dedupe_backend: stateWrite.backend,
+          warnings: collectWarnings(stateRead.warning, stateWrite.warning),
+        });
+        return;
+      }
+    } catch (err) {
+      console.warn("Skipping duplicate check after Feishu folder lookup failed:", err);
+    }
+  }
+
+  // 6. Create the Feishu document
   let documentId: string;
   let documentUrl: string;
   try {
-    const doc = await createDocument(token, docTitle);
+    const doc = await createDocument(token, docTitle, dailyFolderToken);
     documentId = doc.documentId;
     documentUrl = doc.url;
   } catch (err) {
@@ -81,8 +144,8 @@ export default async function handler(
     return;
   }
 
-  // 6. Write content blocks to the document
-  const blocks = markdownToBlocks(markdown);
+  // 7. Write content blocks to the document
+  const blocks = markdownToBlocks(readableMarkdown);
   try {
     await writeBlocksToDocument(token, documentId, blocks);
   } catch (err) {
@@ -92,7 +155,7 @@ export default async function handler(
     return;
   }
 
-  // 7. Send notification to the Feishu group webhook
+  // 8. Send notification to the Feishu group webhook
   try {
     const notif = buildNotification(report, date, documentUrl);
     const webhookRes = await fetch(dailyWebhookUrl, {
@@ -113,18 +176,60 @@ export default async function handler(
     return;
   }
 
+  const stateWrite = await writeDailyReportSentState(
+    stateKey,
+    {
+      date,
+      sent_at: new Date().toISOString(),
+      document_id: documentId,
+      document_url: documentUrl,
+    },
+    stateRead.backend
+  );
+
   res.status(200).json({
     status: "ok",
     date,
     document_id: documentId,
     document_url: documentUrl,
     blocks_written: blocks.length,
+    dedupe_backend: stateWrite.backend,
+    warnings: collectWarnings(stateRead.warning, stateWrite.warning),
   });
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+function buildReadableMarkdown(
+  markdown: string,
+  report: ParsedReport,
+  date: string
+) {
+  const introLines = [
+    "## 简记",
+    `- 日期：${date}`,
+    `- 主题：${report.title}`,
+  ];
+
+  if (report.signals.length > 0) {
+    introLines.push("- 今日重点：");
+    for (const signal of report.signals) {
+      introLines.push(`- ${signal}`);
+    }
+  }
+
+  return `${introLines.join("\n")}\n\n---\n\n${markdown}`;
+}
+
+function normalizeFolderToken(folderToken?: string): string | undefined {
+  if (!folderToken) {
+    return undefined;
+  }
+
+  return folderToken.startsWith("fld") ? folderToken : undefined;
+}
 
 function buildNotification(
   report: ParsedReport,
@@ -154,4 +259,17 @@ function buildNotification(
       },
     },
   };
+}
+
+function collectWarnings(...warnings: Array<string | undefined>): string[] | undefined {
+  const values = warnings
+    .filter((w): w is string => Boolean(w))
+    .map((w) => w.trim())
+    .filter((w) => w.length > 0);
+
+  if (values.length === 0) {
+    return undefined;
+  }
+
+  return Array.from(new Set(values));
 }
