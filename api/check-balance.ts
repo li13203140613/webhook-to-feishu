@@ -395,7 +395,9 @@ async function fetchEvolinkBalance(): Promise<
 
   const remainingUsd = remainingCredits / 100;
   const usedUsd = usedCredits / 100;
-  const unlimited = Boolean(data.data?.token?.unlimited_credits);
+  // Evolink 的 token.unlimited_credits 在部分账号上不稳定，
+  // 这里不据此抑制阈值告警，避免漏发 30/20/10/0 提醒。
+  const unlimited = false;
 
   return {
     ok: true,
