@@ -59,11 +59,14 @@ cp .env.example .env.local
 | `FEISHU_WEBHOOK_URL` | Feishu bot webhook URL from the bot configuration page |
 | `FEISHU_WEBHOOK_SECRET` | Feishu bot signing secret (加签密钥) |
 | `BARK_PROXY_TOKEN` | Optional shared token for `/api/bark` requests |
-| `ALERT_FORWARD_INTERVAL_MINUTES` | *(Optional)* Shared minimum reminder interval (minutes) for `/api/webhook`, `/api/bark`, and `/api/check-balance`. Defaults to `60` |
-| `ALERT_FORWARD_THROTTLE_KEY` | *(Optional)* Shared throttle key for `/api/webhook`, `/api/bark`, and `/api/check-balance`. Defaults to `outbound:feishu:notification` |
+| `ALERT_FORWARD_INTERVAL_MINUTES` | *(Optional)* Shared minimum reminder interval (minutes) for `/api/webhook` and `/api/bark`. Defaults to `60` |
+| `ALERT_FORWARD_THROTTLE_KEY` | *(Optional)* Shared throttle key for `/api/webhook` and `/api/bark`. Defaults to `outbound:feishu:notification` |
+| `BALANCE_PROVIDER` | *(Optional)* Balance source provider: `apimart` or `evolink`. Defaults to `apimart` |
+| `APIMART_API_KEY` | APIMart API key (required when `BALANCE_PROVIDER=apimart`) |
+| `APIMART_API_URL` | *(Optional)* APIMart base URL. Defaults to `https://api.apimart.ai/v1` |
 | `EVOLINK_API_KEY` | Evolink API key for balance checks |
 | `EVOLINK_API_URL` | *(Optional)* Evolink API base URL. Defaults to `https://api.evolink.ai/v1` |
-| `BALANCE_ALERT_STATE_KEY` | *(Optional)* KV key used to store balance alert state. Defaults to `evolink:balance-alert-state` |
+| `BALANCE_ALERT_STATE_KEY` | *(Optional)* KV key used to store balance alert state. Defaults to `<provider>:balance-alert-state` |
 | `KV_REST_API_URL` | *(Optional but recommended)* Vercel KV REST URL. Enables cross-instance dedupe/throttling |
 | `KV_REST_API_TOKEN` | *(Optional but recommended)* Vercel KV REST token |
 | `DAILY_REPORT_STATE_KEY_PREFIX` | *(Optional)* Daily report dedupe state prefix. Defaults to `builderpulse:daily-report:sent` |
@@ -122,12 +125,12 @@ sign       = Base64(HMAC-SHA256(data, key=""))
 | GET | `/api/webhook` | Health check — returns `{"status":"ok"}` |
 | POST | `/api/webhook` | Receive upstream webhook and forward to Feishu |
 | GET / POST | `/api/bark` | Accept Bark-style payloads and forward to Feishu |
-| GET | `/api/check-balance` | Check Evolink credit balance; sends Feishu alert if below threshold |
+| GET | `/api/check-balance` | Check APIMart/Evolink balance; sends Feishu alert if below threshold |
 | GET | `/api/daily-report` | Fetch BuilderPulse daily report, write to Feishu doc, notify group |
 
 ## Upstream forward throttling
 
-`/api/webhook`, `/api/bark`, and `/api/check-balance` now share one throttle window.
+`/api/webhook` and `/api/bark` share one throttle window.
 
 - If upstream triggers repeatedly within 60 minutes (default), only the first one is forwarded.
 - Later triggers within the same window return `{"status":"suppressed_by_rate_limit",...}` and are not sent to Feishu.
@@ -135,19 +138,23 @@ sign       = Base64(HMAC-SHA256(data, key=""))
 
 ## Balance check
 
-`GET /api/check-balance` calls the Evolink API and checks `user.remaining_credits`.
+`GET /api/check-balance` supports two providers:
+
+- `BALANCE_PROVIDER=apimart` → `GET /v1/user/balance` (`remain_balance`, `used_balance`)
+- `BALANCE_PROVIDER=evolink` → `GET /credits` (`user.remaining_credits`, `user.used_credits`)
 
 - Alert thresholds:
-  - `<= 3000` → `余额低于 30 元`
-  - `<= 2000` → `余额低于 20 元`
-  - `<= 1000` → `余额低于 10 元`
-  - `<= 0` → `余额已耗尽`（立即提醒，不受共享限流限制）
+  - `<= 30` → `余额低于 30`
+  - `<= 20` → `余额低于 20`
+  - `<= 10` → `余额低于 10`
+  - `<= 0` → `余额已耗尽`
 - When balance is healthy (not below any threshold), returns `{"status":"ok",...}` and sends no Feishu message.
 - When balance is below threshold:
-  - Sends only when crossing into a worse threshold than the last sent threshold.
-  - If the shared hourly throttle window is occupied, returns `{"status":"alert_suppressed","suppressed_reason":"shared_rate_limit"}`.
+  - Sends only when crossing into a worse threshold than the last sent threshold (30/20/10/0 each at most once).
+  - Does not use the `/api/webhook`/`/api/bark` throttle bucket.
+  - Requires KV durable state. If KV is unavailable, the function suppresses alerts to avoid duplicate spam.
 
-Triggered automatically every hour via Vercel Cron.
+Triggered automatically every 5 minutes via Vercel Cron.
 
 ## Daily BuilderPulse report
 

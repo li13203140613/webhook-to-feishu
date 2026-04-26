@@ -5,7 +5,6 @@ import {
   writeBalanceAlertState,
 } from "../lib/balance-alert-state";
 import { postToFeishu } from "../lib/feishu";
-import { consumeNotificationThrottle } from "../lib/notification-throttle";
 
 interface Threshold {
   level: number;
@@ -14,18 +13,23 @@ interface Threshold {
 }
 
 const THRESHOLDS: Threshold[] = [
-  { level: 3000, emoji: "⚠️", label: "余额低于 30 元" },
-  { level: 2000, emoji: "🔴", label: "余额低于 20 元" },
-  { level: 1000, emoji: "🚨", label: "余额低于 10 元" },
+  { level: 30, emoji: "⚠️", label: "余额低于 30" },
+  { level: 20, emoji: "🔴", label: "余额低于 20" },
+  { level: 10, emoji: "🚨", label: "余额低于 10" },
   { level: 0, emoji: "🆘", label: "余额已耗尽" },
 ];
 
-const DEFAULT_ALERT_STATE_KEY = "evolink:balance-alert-state";
-const DEFAULT_SHARED_THROTTLE_KEY = "outbound:feishu:notification";
-const DEFAULT_SHARED_INTERVAL_MINUTES = 60;
+const DEFAULT_BALANCE_PROVIDER = "apimart";
+const DEFAULT_APIMART_API_URL = "https://api.apimart.ai/v1";
+const DEFAULT_EVOLINK_API_URL = "https://api.evolink.ai/v1";
 
+type BalanceProvider = "apimart" | "evolink";
 type TriggerReason = "threshold_crossed" | "balance_exhausted";
-type SuppressedReason = "threshold_not_worse" | "shared_rate_limit";
+type SuppressedReason =
+  | "threshold_not_worse"
+  | "durable_state_unavailable"
+  | "state_write_failed"
+  | "provider_unlimited";
 
 interface EvolinkCredits {
   remaining_credits: number;
@@ -35,13 +39,36 @@ interface EvolinkCredits {
 interface EvolinkResponse {
   data: {
     user: EvolinkCredits;
-    token: {
-      remaining_credits: number;
-      unlimited_credits: boolean;
-      used_credits: number;
+    token?: {
+      remaining_credits?: number;
+      unlimited_credits?: boolean;
+      used_credits?: number;
     };
   };
   success: boolean;
+}
+
+interface ApiMartResponse {
+  success: boolean;
+  message?: string;
+  remain_balance?: number;
+  used_balance?: number;
+  unlimited_quota?: boolean;
+}
+
+interface BalanceSnapshot {
+  provider: BalanceProvider;
+  providerLabel: string;
+  remainingBalance: number;
+  usedBalance: number;
+  unlimited: boolean;
+  displayLines: string[];
+}
+
+interface BalanceFetchError {
+  status: number;
+  error: string;
+  detail?: unknown;
 }
 
 export default async function handler(
@@ -53,137 +80,162 @@ export default async function handler(
     return;
   }
 
-  const evolinkApiKey = process.env.EVOLINK_API_KEY;
-  const evolinkBaseUrl = process.env.EVOLINK_API_URL ?? "https://api.evolink.ai/v1";
-  const evolinkApiUrl = `${evolinkBaseUrl.replace(/\/+$/, "")}/credits`;
   const feishuUrl = process.env.FEISHU_WEBHOOK_URL;
   const feishuSecret = process.env.FEISHU_WEBHOOK_SECRET;
 
-  if (!evolinkApiKey) {
-    res.status(500).json({ error: "Missing EVOLINK_API_KEY" });
-    return;
-  }
   if (!feishuUrl || !feishuSecret) {
     res.status(500).json({ error: "Missing FEISHU_WEBHOOK_URL or FEISHU_WEBHOOK_SECRET" });
     return;
   }
 
-  let evolinkData: EvolinkResponse;
-  try {
-    const evolinkRes = await fetch(evolinkApiUrl, {
-      headers: { Authorization: `Bearer ${evolinkApiKey}` },
-    });
-    if (!evolinkRes.ok) {
-      const detail = await evolinkRes.text().catch(() => null);
-      res.status(502).json({ error: "Evolink API returned an error", detail });
-      return;
-    }
-    evolinkData = (await evolinkRes.json()) as EvolinkResponse;
-  } catch (err) {
-    res.status(502).json({ error: "Failed to reach Evolink API", detail: String(err) });
+  const provider = normalizeProvider(process.env.BALANCE_PROVIDER);
+  if (!provider) {
+    res.status(500).json({ error: "Invalid BALANCE_PROVIDER (expected apimart or evolink)" });
     return;
   }
 
-  const { remaining_credits, used_credits } = evolinkData.data.user;
-  const stateKey = process.env.BALANCE_ALERT_STATE_KEY ?? DEFAULT_ALERT_STATE_KEY;
-  const sharedThrottleKey =
-    process.env.ALERT_FORWARD_THROTTLE_KEY ?? DEFAULT_SHARED_THROTTLE_KEY;
-  const sharedIntervalMinutes = parsePositiveInt(
-    process.env.ALERT_FORWARD_INTERVAL_MINUTES,
-    DEFAULT_SHARED_INTERVAL_MINUTES
-  );
+  const fetchResult = await fetchBalanceSnapshot(provider);
+  if (!fetchResult.ok) {
+    res
+      .status(fetchResult.error.status)
+      .json({ error: fetchResult.error.error, detail: fetchResult.error.detail });
+    return;
+  }
+
+  const snapshot = fetchResult.snapshot;
+  const stateKey =
+    process.env.BALANCE_ALERT_STATE_KEY ?? `${provider}:balance-alert-state`;
 
   const stateRead = await readBalanceAlertState(stateKey);
+  const warningsFromRead = collectWarnings(stateRead.warning);
+
+  // No durable state = no reliable dedupe. Fail closed to avoid duplicate spam.
+  if (stateRead.backend !== "vercel_kv") {
+    res.status(503).json({
+      status: "alert_suppressed",
+      suppressed_reason: "durable_state_unavailable" as SuppressedReason,
+      provider,
+      remaining_balance: snapshot.remainingBalance,
+      used_balance: snapshot.usedBalance,
+      state_backend: stateRead.backend,
+      warnings: warningsFromRead,
+    });
+    return;
+  }
+
   const previousState = stateRead.state;
   const previousThreshold = previousState?.threshold_level ?? null;
-  const currentThreshold = resolveCurrentThreshold(remaining_credits);
+
+  if (snapshot.unlimited) {
+    const stateWrite = await writeBalanceAlertState(
+      stateKey,
+      {
+        remaining_credits: snapshot.remainingBalance,
+        used_credits: snapshot.usedBalance,
+        threshold_level: null,
+        last_alert_at: previousState?.last_alert_at ?? null,
+      },
+      "vercel_kv"
+    );
+
+    res.status(200).json({
+      status: "alert_suppressed",
+      suppressed_reason: "provider_unlimited" as SuppressedReason,
+      provider,
+      remaining_balance: snapshot.remainingBalance,
+      used_balance: snapshot.usedBalance,
+      state_backend: stateWrite.backend,
+      warnings: collectWarnings(stateRead.warning, stateWrite.warning),
+    });
+    return;
+  }
+
+  const currentThreshold = resolveCurrentThreshold(snapshot.remainingBalance);
 
   if (!currentThreshold) {
     const healthyState: BalanceAlertState = {
-      remaining_credits,
-      used_credits,
+      remaining_credits: snapshot.remainingBalance,
+      used_credits: snapshot.usedBalance,
       threshold_level: null,
       last_alert_at: previousState?.last_alert_at ?? null,
     };
     const stateWrite = await writeBalanceAlertState(
       stateKey,
       healthyState,
-      stateRead.backend
+      "vercel_kv"
     );
+    const warnings = collectWarnings(stateRead.warning, stateWrite.warning);
+
+    if (stateWrite.backend !== "vercel_kv") {
+      res.status(503).json({
+        status: "alert_suppressed",
+        suppressed_reason: "state_write_failed" as SuppressedReason,
+        provider,
+        remaining_balance: snapshot.remainingBalance,
+        used_balance: snapshot.usedBalance,
+        state_backend: stateWrite.backend,
+        warnings,
+      });
+      return;
+    }
 
     res.status(200).json({
       status: "ok",
-      remaining_credits,
-      used_credits,
+      provider,
+      remaining_balance: snapshot.remainingBalance,
+      used_balance: snapshot.usedBalance,
       state_backend: stateWrite.backend,
-      warnings: collectWarnings(stateRead.warning, stateWrite.warning),
+      warnings,
     });
     return;
   }
 
   if (!isWorseThreshold(previousThreshold, currentThreshold.level)) {
-    const stateWithoutAlert: BalanceAlertState = {
-      remaining_credits,
-      used_credits,
-      threshold_level: previousThreshold,
-      last_alert_at: previousState?.last_alert_at ?? null,
-    };
-    const stateWrite = await writeBalanceAlertState(
-      stateKey,
-      stateWithoutAlert,
-      stateRead.backend
-    );
-
     res.status(200).json({
       status: "alert_suppressed",
       suppressed_reason: "threshold_not_worse" as SuppressedReason,
-      remaining_credits,
-      used_credits,
+      provider,
+      remaining_balance: snapshot.remainingBalance,
+      used_balance: snapshot.usedBalance,
       current_threshold: currentThreshold.level,
       threshold_label: currentThreshold.label,
-      state_backend: stateWrite.backend,
-      warnings: collectWarnings(stateRead.warning, stateWrite.warning),
+      state_backend: stateRead.backend,
+      warnings: warningsFromRead,
     });
     return;
   }
 
-  const isZeroBalance = currentThreshold.level === 0;
-  let throttle:
-    | Awaited<ReturnType<typeof consumeNotificationThrottle>>
-    | null = null;
+  const triggerReason: TriggerReason =
+    currentThreshold.level === 0 ? "balance_exhausted" : "threshold_crossed";
+  const nextState: BalanceAlertState = {
+    remaining_credits: snapshot.remainingBalance,
+    used_credits: snapshot.usedBalance,
+    threshold_level: currentThreshold.level,
+    last_alert_at: new Date().toISOString(),
+  };
 
-  if (!isZeroBalance) {
-    throttle = await consumeNotificationThrottle(
-      sharedThrottleKey,
-      sharedIntervalMinutes
-    );
+  // Write state before sending to guarantee at-most-once per threshold level.
+  const stateWrite = await writeBalanceAlertState(stateKey, nextState, "vercel_kv");
+  const warnings = collectWarnings(stateRead.warning, stateWrite.warning);
 
-    if (!throttle.allowed) {
-      res.status(200).json({
-        status: "alert_suppressed",
-        suppressed_reason: "shared_rate_limit" as SuppressedReason,
-        remaining_credits,
-        used_credits,
-        current_threshold: currentThreshold.level,
-        threshold_label: currentThreshold.label,
-        interval_minutes: throttle.interval_minutes,
-        last_sent_at: throttle.last_sent_at,
-        next_send_at: throttle.next_allowed_at,
-        throttle_backend: throttle.backend,
-        warning: throttle.warning,
-      });
-      return;
-    }
+  if (stateWrite.backend !== "vercel_kv") {
+    res.status(503).json({
+      status: "alert_suppressed",
+      suppressed_reason: "state_write_failed" as SuppressedReason,
+      provider,
+      remaining_balance: snapshot.remainingBalance,
+      used_balance: snapshot.usedBalance,
+      current_threshold: currentThreshold.level,
+      threshold_label: currentThreshold.label,
+      state_backend: stateWrite.backend,
+      warnings,
+    });
+    return;
   }
 
-  const triggerReason: TriggerReason = isZeroBalance
-    ? "balance_exhausted"
-    : "threshold_crossed";
-  const estimatedUsd = (remaining_credits / 100).toFixed(1);
   const text =
-    `${currentThreshold.emoji} Evolink ${currentThreshold.label}\n\n` +
-    `账户余额: ${remaining_credits} 积分（约 $${estimatedUsd}）\n` +
-    `已用额度: ${used_credits} 积分\n` +
+    `${currentThreshold.emoji} ${snapshot.providerLabel} ${currentThreshold.label}\n\n` +
+    `${snapshot.displayLines.join("\n")}\n` +
     `触发原因: ${
       triggerReason === "balance_exhausted" ? "余额归零立即提醒" : "关键阈值下穿"
     }\n\n` +
@@ -193,46 +245,176 @@ export default async function handler(
   try {
     result = await postToFeishu(feishuUrl, feishuSecret, text);
   } catch (err) {
+    await rollbackState(stateKey, previousState, snapshot);
     res.status(502).json({ error: "Failed to reach Feishu webhook", detail: String(err) });
     return;
   }
 
   if (!result.ok) {
+    await rollbackState(stateKey, previousState, snapshot);
     res.status(502).json({ error: "Feishu returned an error", detail: result.data });
     return;
   }
 
-  const stateAfterAlert: BalanceAlertState = {
-    remaining_credits,
-    used_credits,
-    threshold_level: currentThreshold.level,
-    last_alert_at: new Date().toISOString(),
-  };
-  const stateWrite = await writeBalanceAlertState(
-    stateKey,
-    stateAfterAlert,
-    stateRead.backend
-  );
-
   res.status(200).json({
     status: "alert_sent",
+    provider,
     trigger_reason: triggerReason,
-    remaining_credits,
-    used_credits,
+    remaining_balance: snapshot.remainingBalance,
+    used_balance: snapshot.usedBalance,
     threshold_level: currentThreshold.level,
     threshold_label: currentThreshold.label,
-    shared_throttle_bypass: isZeroBalance,
-    interval_minutes: throttle?.interval_minutes ?? sharedIntervalMinutes,
-    throttle_backend: throttle?.backend,
-    warning: throttle?.warning,
     state_backend: stateWrite.backend,
-    warnings: collectWarnings(stateRead.warning, stateWrite.warning),
+    warnings,
     feishu: result.data,
   });
 }
 
-function resolveCurrentThreshold(remainingCredits: number): Threshold | null {
-  const matched = THRESHOLDS.filter((t) => remainingCredits <= t.level);
+async function fetchBalanceSnapshot(
+  provider: BalanceProvider
+): Promise<{ ok: true; snapshot: BalanceSnapshot } | { ok: false; error: BalanceFetchError }> {
+  if (provider === "apimart") {
+    return fetchApiMartBalance();
+  }
+
+  return fetchEvolinkBalance();
+}
+
+async function fetchApiMartBalance(): Promise<
+  { ok: true; snapshot: BalanceSnapshot } | { ok: false; error: BalanceFetchError }
+> {
+  const apiKey = process.env.APIMART_API_KEY;
+  if (!apiKey) {
+    return { ok: false, error: { status: 500, error: "Missing APIMART_API_KEY" } };
+  }
+
+  const baseUrl = process.env.APIMART_API_URL ?? DEFAULT_APIMART_API_URL;
+  const url = `${baseUrl.replace(/\/+$/, "")}/user/balance`;
+
+  let res: globalThis.Response;
+  try {
+    res = await fetch(url, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      error: { status: 502, error: "Failed to reach APIMart API", detail: String(err) },
+    };
+  }
+
+  if (!res.ok) {
+    const detail = await res.text().catch(() => null);
+    return {
+      ok: false,
+      error: { status: 502, error: "APIMart API returned an error", detail },
+    };
+  }
+
+  const data = (await res.json()) as ApiMartResponse;
+  if (!data.success) {
+    return {
+      ok: false,
+      error: {
+        status: 502,
+        error: "APIMart balance query failed",
+        detail: data.message ?? data,
+      },
+    };
+  }
+
+  const remain = toFiniteNumber(data.remain_balance);
+  const used = toFiniteNumber(data.used_balance);
+  if (remain === null || used === null) {
+    return {
+      ok: false,
+      error: { status: 502, error: "APIMart balance response is invalid", detail: data },
+    };
+  }
+
+  const unlimited = Boolean(data.unlimited_quota) || remain < 0;
+
+  return {
+    ok: true,
+    snapshot: {
+      provider: "apimart",
+      providerLabel: "APIMart",
+      remainingBalance: remain,
+      usedBalance: used,
+      unlimited,
+      displayLines: [
+        `账户余额: ${formatNumber(remain)}`,
+        `已用额度: ${formatNumber(used)}`,
+        "余额单位以 APIMart 平台配置为准",
+      ],
+    },
+  };
+}
+
+async function fetchEvolinkBalance(): Promise<
+  { ok: true; snapshot: BalanceSnapshot } | { ok: false; error: BalanceFetchError }
+> {
+  const evolinkApiKey = process.env.EVOLINK_API_KEY;
+  if (!evolinkApiKey) {
+    return { ok: false, error: { status: 500, error: "Missing EVOLINK_API_KEY" } };
+  }
+
+  const baseUrl = process.env.EVOLINK_API_URL ?? DEFAULT_EVOLINK_API_URL;
+  const url = `${baseUrl.replace(/\/+$/, "")}/credits`;
+
+  let res: globalThis.Response;
+  try {
+    res = await fetch(url, {
+      headers: { Authorization: `Bearer ${evolinkApiKey}` },
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      error: { status: 502, error: "Failed to reach Evolink API", detail: String(err) },
+    };
+  }
+
+  if (!res.ok) {
+    const detail = await res.text().catch(() => null);
+    return {
+      ok: false,
+      error: { status: 502, error: "Evolink API returned an error", detail },
+    };
+  }
+
+  const data = (await res.json()) as EvolinkResponse;
+  const remainingCredits = toFiniteNumber(data.data?.user?.remaining_credits);
+  const usedCredits = toFiniteNumber(data.data?.user?.used_credits);
+
+  if (remainingCredits === null || usedCredits === null) {
+    return {
+      ok: false,
+      error: { status: 502, error: "Evolink balance response is invalid", detail: data },
+    };
+  }
+
+  const remainingUsd = remainingCredits / 100;
+  const usedUsd = usedCredits / 100;
+  const unlimited = Boolean(data.data?.token?.unlimited_credits);
+
+  return {
+    ok: true,
+    snapshot: {
+      provider: "evolink",
+      providerLabel: "Evolink",
+      remainingBalance: remainingUsd,
+      usedBalance: usedUsd,
+      unlimited,
+      displayLines: [
+        `账户余额: ${formatNumber(remainingCredits)} 积分（约 $${formatNumber(remainingUsd)}）`,
+        `已用额度: ${formatNumber(usedCredits)} 积分（约 $${formatNumber(usedUsd)}）`,
+      ],
+    },
+  };
+}
+
+function resolveCurrentThreshold(remainingBalance: number): Threshold | null {
+  const matched = THRESHOLDS.filter((t) => remainingBalance <= t.level);
   if (matched.length === 0) {
     return null;
   }
@@ -240,10 +422,7 @@ function resolveCurrentThreshold(remainingCredits: number): Threshold | null {
   return matched.reduce((a, b) => (a.level < b.level ? a : b));
 }
 
-function isWorseThreshold(
-  previousLevel: number | null,
-  currentLevel: number
-): boolean {
+function isWorseThreshold(previousLevel: number | null, currentLevel: number): boolean {
   if (previousLevel === null) {
     return true;
   }
@@ -251,17 +430,49 @@ function isWorseThreshold(
   return currentLevel < previousLevel;
 }
 
-function parsePositiveInt(value: string | undefined, fallback: number): number {
-  if (!value) {
-    return fallback;
+async function rollbackState(
+  stateKey: string,
+  previousState: BalanceAlertState | null,
+  snapshot: BalanceSnapshot
+): Promise<void> {
+  const rollback: BalanceAlertState = previousState ?? {
+    remaining_credits: snapshot.remainingBalance,
+    used_credits: snapshot.usedBalance,
+    threshold_level: null,
+    last_alert_at: null,
+  };
+
+  await writeBalanceAlertState(stateKey, rollback, "vercel_kv").catch(() => undefined);
+}
+
+function normalizeProvider(value: string | undefined): BalanceProvider | null {
+  const provider = (value ?? DEFAULT_BALANCE_PROVIDER).trim().toLowerCase();
+  if (provider === "apimart" || provider === "evolink") {
+    return provider;
   }
 
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return fallback;
+  return null;
+}
+
+function toFiniteNumber(value: unknown): number | null {
+  if (typeof value !== "number") {
+    return null;
   }
 
-  return parsed;
+  if (!Number.isFinite(value)) {
+    return null;
+  }
+
+  return value;
+}
+
+function formatNumber(value: number): string {
+  const rounded = Math.round((value + Number.EPSILON) * 10000) / 10000;
+  if (Number.isInteger(rounded)) {
+    return String(rounded);
+  }
+
+  return String(rounded);
 }
 
 function collectWarnings(...warnings: Array<string | undefined>): string[] | undefined {
