@@ -16,7 +16,6 @@ const THRESHOLDS: Threshold[] = [
   { level: 30, emoji: "⚠️", label: "余额低于 30" },
   { level: 20, emoji: "🔴", label: "余额低于 20" },
   { level: 10, emoji: "🚨", label: "余额低于 10" },
-  { level: 0, emoji: "🆘", label: "余额已耗尽" },
 ];
 
 const DEFAULT_BALANCE_PROVIDER = "apimart";
@@ -24,7 +23,7 @@ const DEFAULT_APIMART_API_URL = "https://api.apimart.ai/v1";
 const DEFAULT_EVOLINK_API_URL = "https://api.evolink.ai/v1";
 
 type BalanceProvider = "apimart" | "evolink";
-type TriggerReason = "threshold_crossed" | "balance_exhausted";
+type TriggerReason = "threshold_crossed";
 type SuppressedReason =
   | "threshold_not_worse"
   | "durable_state_unavailable"
@@ -205,8 +204,7 @@ export default async function handler(
     return;
   }
 
-  const triggerReason: TriggerReason =
-    currentThreshold.level === 0 ? "balance_exhausted" : "threshold_crossed";
+  const triggerReason: TriggerReason = "threshold_crossed";
   const nextState: BalanceAlertState = {
     remaining_credits: snapshot.remainingBalance,
     used_credits: snapshot.usedBalance,
@@ -236,9 +234,7 @@ export default async function handler(
   const text =
     `${currentThreshold.emoji} ${snapshot.providerLabel} ${currentThreshold.label}\n\n` +
     `${snapshot.displayLines.join("\n")}\n` +
-    `触发原因: ${
-      triggerReason === "balance_exhausted" ? "余额归零立即提醒" : "关键阈值下穿"
-    }\n\n` +
+    `触发原因: 关键阈值下穿\n\n` +
     "请及时充值！";
 
   let result: { ok: boolean; data: unknown };

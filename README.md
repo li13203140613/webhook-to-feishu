@@ -147,10 +147,9 @@ sign       = Base64(HMAC-SHA256(data, key=""))
   - `<= 30` → `余额低于 30`
   - `<= 20` → `余额低于 20`
   - `<= 10` → `余额低于 10`
-  - `<= 0` → `余额已耗尽`
 - When balance is healthy (not below any threshold), returns `{"status":"ok",...}` and sends no Feishu message.
 - When balance is below threshold:
-  - Sends only when crossing into a worse threshold than the last sent threshold (30/20/10/0 each at most once).
+  - Sends only when crossing into a worse threshold than the last sent threshold (30/20/10 each at most once).
   - Does not use the `/api/webhook`/`/api/bark` throttle bucket.
   - Requires KV durable state. If KV is unavailable, the function suppresses alerts to avoid duplicate spam.
 
