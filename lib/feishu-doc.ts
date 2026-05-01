@@ -26,6 +26,21 @@ interface CreateDocResponse {
   };
 }
 
+interface ListFilesResponse {
+  code: number;
+  msg: string;
+  data?: {
+    files?: Array<{
+      name: string;
+      token: string;
+      type?: string;
+      url?: string;
+    }>;
+    has_more?: boolean;
+    next_page_token?: string;
+  };
+}
+
 interface BlockApiResponse {
   code: number;
   msg: string;
@@ -36,6 +51,10 @@ type BlockType = 2 | 3 | 4 | 5 | 12;
 interface TextElementStyle {
   bold?: boolean;
   italic?: boolean;
+  codeInline?: boolean;
+  link?: {
+    url: string;
+  };
 }
 
 interface TextRun {
@@ -138,6 +157,68 @@ export async function createDocument(
   };
 }
 
+/**
+ * Finds an existing document with the exact title inside a Feishu Drive folder.
+ * Returns the first matching document if found, otherwise null.
+ */
+export async function findDocumentByTitleInFolder(
+  token: string,
+  folderToken: string,
+  title: string
+): Promise<{ documentId: string; url: string } | null> {
+  let pageToken: string | undefined;
+
+  while (true) {
+    const params = new URLSearchParams({
+      folder_token: folderToken,
+      page_size: "200",
+    });
+
+    if (pageToken) {
+      params.set("page_token", pageToken);
+    }
+
+    const res = await fetch(
+      `https://open.feishu.cn/open-apis/drive/v1/files?${params.toString()}`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      }
+    );
+
+    if (!res.ok) {
+      const detail = await res.text().catch(() => null);
+      throw new Error(`List files failed: HTTP ${res.status} — ${detail}`);
+    }
+
+    const data = (await res.json()) as ListFilesResponse;
+    if (data.code !== 0) {
+      throw new Error(`List files error (code ${data.code}): ${data.msg}`);
+    }
+
+    const files = data.data?.files ?? [];
+    const existing = files.find(
+      (file) =>
+        file.name === title &&
+        (file.type === "docx" || file.url?.includes("/docx/"))
+    );
+
+    if (existing) {
+      return {
+        documentId: existing.token,
+        url: existing.url ?? `https://feishu.cn/docx/${existing.token}`,
+      };
+    }
+
+    if (!data.data?.has_more || !data.data.next_page_token) {
+      return null;
+    }
+
+    pageToken = data.data.next_page_token;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Block writing
 // ---------------------------------------------------------------------------
@@ -204,28 +285,58 @@ function addSectionEmoji(heading: string): string {
   return heading;
 }
 
-/** Splits a text string on **bold** markers into styled text elements. */
+/** Converts inline markdown to styled Feishu text elements. */
 function toElements(text: string): TextElement[] {
   const elements: TextElement[] = [];
-  const re = /\*\*(.+?)\*\*/g;
-  let last = 0;
-  let m: RegExpExecArray | null;
+  const tokenRe =
+    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|\*\*([^*]+)\*\*|`([^`]+)`|\*([^*]+)\*/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
 
-  while ((m = re.exec(text)) !== null) {
-    if (m.index > last) {
-      elements.push({ text_run: { content: text.slice(last, m.index) } });
+  while ((match = tokenRe.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      elements.push({
+        text_run: { content: text.slice(lastIndex, match.index) },
+      });
     }
-    elements.push({
-      text_run: {
-        content: m[1],
-        text_element_style: { bold: true },
-      },
-    });
-    last = m.index + m[0].length;
+
+    if (match[1] && match[2]) {
+      elements.push({
+        text_run: {
+          content: match[1],
+          text_element_style: {
+            link: { url: match[2] },
+          },
+        },
+      });
+    } else if (match[3]) {
+      elements.push({
+        text_run: {
+          content: match[3],
+          text_element_style: { bold: true },
+        },
+      });
+    } else if (match[4]) {
+      elements.push({
+        text_run: {
+          content: match[4],
+          text_element_style: { codeInline: true },
+        },
+      });
+    } else if (match[5]) {
+      elements.push({
+        text_run: {
+          content: match[5],
+          text_element_style: { italic: true },
+        },
+      });
+    }
+
+    lastIndex = match.index + match[0].length;
   }
 
-  if (last < text.length) {
-    elements.push({ text_run: { content: text.slice(last) } });
+  if (lastIndex < text.length) {
+    elements.push({ text_run: { content: text.slice(lastIndex) } });
   }
 
   return elements.length > 0
@@ -270,10 +381,21 @@ export function markdownToBlocks(markdown: string): FeishuBlock[] {
       blocks.push(block(4, toElements(addSectionEmoji(line.slice(3).trim()))));
     } else if (line.startsWith("### ")) {
       blocks.push(block(5, toElements(addSectionEmoji(line.slice(4).trim()))));
+    } else if (/^\d+\.\s+/.test(line)) {
+      blocks.push(block(12, toElements(line.replace(/^\d+\.\s+/, "").trim())));
     } else if (line.startsWith("> ")) {
       const content = line.slice(2).trim();
       const display = content.startsWith("🎯") ? content : `🎯 ${content}`;
       blocks.push(block(2, toElements(display)));
+    } else if (line.startsWith("**🔍 信号**：")) {
+      blocks.push(block(5, toElements("🔍 信号")));
+      blocks.push(block(2, toElements(line.replace("**🔍 信号**：", "").trim())));
+    } else if (line.startsWith("**关键判断**：")) {
+      blocks.push(block(5, toElements("✅ 关键判断")));
+      blocks.push(block(2, toElements(line.replace("**关键判断**：", "").trim())));
+    } else if (line.startsWith("**反向视角**：")) {
+      blocks.push(block(5, toElements("⚠️ 反向视角")));
+      blocks.push(block(2, toElements(line.replace("**反向视角**：", "").trim())));
     } else if (line.startsWith("- ") || line.startsWith("* ")) {
       blocks.push(block(12, toElements(line.slice(2).trim())));
     } else if (line === "" || line === "---") {

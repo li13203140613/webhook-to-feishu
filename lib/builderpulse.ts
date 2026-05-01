@@ -47,6 +47,7 @@ export async function fetchDailyReport(date: string): Promise<string | null> {
 export function parseReport(markdown: string): ParsedReport {
   let title = "";
   const signals: string[] = [];
+  let inTopSignals = false;
 
   for (const raw of markdown.split("\n")) {
     const line = raw.trimEnd();
@@ -56,8 +57,25 @@ export function parseReport(markdown: string): ParsedReport {
       continue;
     }
 
-    if (signals.length < 3 && line.startsWith("> ") && /\d/.test(line)) {
-      signals.push(line.slice(2).trim());
+    if (line.startsWith("## ")) {
+      inTopSignals = line.includes("Top 3") || line.includes("今日 Top 3");
+      continue;
+    }
+
+    if (signals.length < 3 && line.startsWith("> ")) {
+      const content = line.slice(2).trim();
+      if (/\d/.test(content)) {
+        signals.push(content);
+      }
+      continue;
+    }
+
+    if (inTopSignals && signals.length < 3) {
+      const numbered = line.match(/^\d+\.\s+(.+)$/);
+      if (numbered) {
+        signals.push(numbered[1].trim());
+        continue;
+      }
     }
   }
 
